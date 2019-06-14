@@ -11,19 +11,26 @@ import android.graphics.Matrix;
 import android.graphics.Paint;
 import android.graphics.Paint.Style;
 import android.graphics.RectF;
+import android.graphics.SurfaceTexture;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
+import android.os.Looper;
+import android.os.Message;
 import android.os.SystemClock;
 import android.support.v4.app.ActivityCompat;
 import android.support.v7.app.AppCompatActivity;
 import android.util.Log;
 import android.util.Size;
 import android.view.Surface;
+import android.view.SurfaceHolder;
+import android.view.SurfaceView;
+import android.view.TextureView;
 import android.view.View;
 import android.widget.Button;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.File;
@@ -37,8 +44,12 @@ import java.util.List;
 
 import dji.common.camera.SettingsDefinitions;
 import dji.common.error.DJIError;
+import dji.common.product.Model;
 import dji.common.util.CommonCallbacks;
 import dji.log.DJILog;
+import dji.sdk.base.BaseProduct;
+import dji.sdk.camera.Camera;
+import dji.sdk.camera.VideoFeeder;
 import dji.sdk.codec.DJICodecManager;
 import dji.sdk.media.DownloadListener;
 import dji.sdk.media.FetchMediaTask;
@@ -51,6 +62,7 @@ import com.example.modeling3d.singleuavsystem.media.DJIVideoStreamDecoder;
 
 import com.example.modeling3d.singleuavsystem.customview.OverlayView;
 import com.example.modeling3d.singleuavsystem.customview.OverlayView.DrawCallback;
+import com.example.modeling3d.singleuavsystem.media.NativeHelper;
 import com.example.modeling3d.singleuavsystem.tflite.Classifier;
 import com.example.modeling3d.singleuavsystem.tflite.TFLiteObjectDetectionAPIModel;
 import com.example.modeling3d.singleuavsystem.tracking.MultiBoxTracker;
@@ -70,7 +82,6 @@ public class MainActivity extends AppCompatActivity implements DJICodecManager.Y
     private ProgressDialog mLoadingDialog;
 
     private ProgressDialog mDownloadDialog;
-    File destDir = new File(Environment.getExternalStorageDirectory().getPath() + "/MediaDownload/");
     private int currentProgress = -1;
 
     /***
@@ -122,6 +133,45 @@ public class MainActivity extends AppCompatActivity implements DJICodecManager.Y
     private byte[][] yuvBytes = new byte[3][];
     private int[] rgbBytes = null;
 
+    private TextureView videostreamPreviewTtView;
+    private SurfaceView videostreamPreviewSf;
+    private SurfaceHolder videostreamPreviewSh;
+    private Camera mCamera;
+    private DJICodecManager mCodecManager;
+    private TextView savePath;
+    private Button screenShot;
+    private StringBuilder stringBuilder;
+    private int videoViewWidth;
+    private int videoViewHeight;
+    private int count;
+
+    private static final int MSG_WHAT_SHOW_TOAST = 0;
+    private static final int MSG_WHAT_UPDATE_TITLE = 1;
+    private SurfaceHolder.Callback surfaceCallback;
+    private enum DemoType { USE_TEXTURE_VIEW, USE_SURFACE_VIEW, USE_SURFACE_VIEW_DEMO_DECODER}
+    private static DemoType demoType = DemoType.USE_TEXTURE_VIEW;
+    private VideoFeeder.VideoFeed standardVideoFeeder;
+
+    protected VideoFeeder.VideoDataListener mReceivedVideoDataListener = null;
+    private TextView titleTv;
+    public Handler mainHandler = new Handler(Looper.getMainLooper()) {
+        @Override
+        public void handleMessage(Message msg) {
+            switch (msg.what) {
+                case MSG_WHAT_SHOW_TOAST:
+                    Toast.makeText(getApplicationContext(), (String) msg.obj, Toast.LENGTH_SHORT).show();
+                    break;
+                case MSG_WHAT_UPDATE_TITLE:
+                    if (titleTv != null) {
+                        titleTv.setText((String) msg.obj);
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+    };
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -147,7 +197,7 @@ public class MainActivity extends AppCompatActivity implements DJICodecManager.Y
         downloadBtn = findViewById(R.id.downloadBtn);
 
 
-        initMediaManager();
+        //initMediaManager();
         //Init Download Dialog
         mDownloadDialog = new ProgressDialog(MainActivity.this);
         mDownloadDialog.setTitle("Downloading file");
@@ -166,155 +216,278 @@ public class MainActivity extends AppCompatActivity implements DJICodecManager.Y
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        initSurfaceOrTextureView();
+        notifyStatusChange();
+    }
+
+    @Override
+    protected void onPause() {
+        if (mCamera != null) {
+            if (VideoFeeder.getInstance().getPrimaryVideoFeed() != null) {
+                VideoFeeder.getInstance().getPrimaryVideoFeed().removeVideoDataListener(mReceivedVideoDataListener);
+            }
+            if (standardVideoFeeder != null) {
+                standardVideoFeeder.removeVideoDataListener(mReceivedVideoDataListener);
+            }
+        }
+        super.onPause();
+    }
+
+    private long lastupdate;
+    private void notifyStatusChange() {
+
+        final BaseProduct product = VideoDecodingApplication.getProductInstance();
+
+        Log.d(TAG, "notifyStatusChange: " + (product == null ? "Disconnect" : (product.getModel() == null ? "null model" : product.getModel().name())));
+        if (product != null && product.isConnected() && product.getModel() != null) {
+            updateTitle(product.getModel().name() + " Connected " + demoType.name());
+        } else {
+            updateTitle("Disconnected");
+        }
+
+        // The callback for receiving the raw H264 video data for camera live view
+        mReceivedVideoDataListener = new VideoFeeder.VideoDataListener() {
+
+            @Override
+            public void onReceive(byte[] videoBuffer, int size) {
+                if (System.currentTimeMillis() - lastupdate > 1000) {
+                    Log.d(TAG, "camera recv video data size: " + size);
+                    lastupdate = System.currentTimeMillis();
+                }
+                switch (demoType) {
+                    case USE_SURFACE_VIEW:
+                        if (mCodecManager != null) {
+                            mCodecManager.sendDataToDecoder(videoBuffer, size);
+                        }
+                        break;
+                    case USE_SURFACE_VIEW_DEMO_DECODER:
+                        /**
+                         we use standardVideoFeeder to pass the transcoded video data to DJIVideoStreamDecoder, and then display it
+                         * on surfaceView
+                         */
+                        DJIVideoStreamDecoder.getInstance().parse(videoBuffer, size);
+                        break;
+
+                    case USE_TEXTURE_VIEW:
+                        if (mCodecManager != null) {
+                            mCodecManager.sendDataToDecoder(videoBuffer, size);
+                        }
+                        break;
+                }
+
+            }
+        };
+
+        if (null == product || !product.isConnected()) {
+            mCamera = null;
+            showToast("Disconnected");
+        } else {
+            if (!product.getModel().equals(Model.UNKNOWN_AIRCRAFT)) {
+                mCamera = product.getCamera();
+                mCamera.setMode(SettingsDefinitions.CameraMode.SHOOT_PHOTO, new CommonCallbacks.CompletionCallback() {
+                    @Override
+                    public void onResult(DJIError djiError) {
+                        if (djiError != null) {
+                            showToast("can't change mode of camera, error:"+djiError.getDescription());
+                        }
+                    }
+                });
+
+                if (demoType == DemoType.USE_SURFACE_VIEW_DEMO_DECODER) {
+                    if (VideoFeeder.getInstance() != null) {
+                        standardVideoFeeder = VideoFeeder.getInstance().provideTranscodedVideoFeed();
+                        standardVideoFeeder.addVideoDataListener(mReceivedVideoDataListener);
+                    }
+                } else {
+                    if (VideoFeeder.getInstance().getPrimaryVideoFeed() != null) {
+                        VideoFeeder.getInstance().getPrimaryVideoFeed().addVideoDataListener(mReceivedVideoDataListener);
+                    }
+                }
+            }
+        }
+    }
+
+
+    private void initSurfaceOrTextureView(){
+        switch (demoType) {
+            case USE_SURFACE_VIEW:
+                initPreviewerSurfaceView();
+                break;
+            case USE_SURFACE_VIEW_DEMO_DECODER:
+                /**
+                 * we also need init the textureView because the pre-transcoded video steam will display in the textureView
+                 */
+                initPreviewerTextureView();
+
+                /**
+                 * we use standardVideoFeeder to pass the transcoded video data to DJIVideoStreamDecoder, and then display it
+                 * on surfaceView
+                 */
+                initPreviewerSurfaceView();
+                break;
+            case USE_TEXTURE_VIEW:
+                initPreviewerTextureView();
+                break;
+        }
+    }
+
+    @Override
     protected void onDestroy() {
 
         SingleApplication.getCameraInstance().setMode(SettingsDefinitions.CameraMode.SHOOT_PHOTO, new CommonCallbacks.CompletionCallback() {
             @Override
             public void onResult(DJIError mError) {
-            if (mError != null){
-                setResultToToast("Set Shoot Photo Mode Failed" + mError.getDescription());
-            }
+                if (mError != null){
+                    setResultToToast("Set Shoot Photo Mode Failed" + mError.getDescription());
+                }
             }
         });
 
         if (mediaFileList != null) {
             mediaFileList.clear();
         }
+
+        if (mCodecManager != null) {
+            mCodecManager.cleanSurface();
+            mCodecManager.destroyCodec();
+        }
         super.onDestroy();
     }
 
-    private MediaManager.FileListStateListener updateFileListStateListener = new MediaManager.FileListStateListener() {
-        @Override
-        public void onFileListStateChange(MediaManager.FileListState state) {
-        currentFileListState = state;
-        }
-    };
+//    private MediaManager.FileListStateListener updateFileListStateListener = new MediaManager.FileListStateListener() {
+//        @Override
+//        public void onFileListStateChange(MediaManager.FileListState state) {
+//        currentFileListState = state;
+//        }
+//    };
 
-    private void initMediaManager() {
-        if (SingleApplication.getProductInstance() == null) {
-            mediaFileList.clear();
-            DJILog.e(TAG, "Product disconnected");
-            return;
-        } else {
-            if (null != SingleApplication.getCameraInstance() && SingleApplication.getCameraInstance().isMediaDownloadModeSupported()) {
-                mMediaManager = SingleApplication.getCameraInstance().getMediaManager();
-                if (null != mMediaManager) {
-                    mMediaManager.addUpdateFileListStateListener(this.updateFileListStateListener);
-                    SingleApplication.getCameraInstance().setMode(SettingsDefinitions.CameraMode.MEDIA_DOWNLOAD, new CommonCallbacks.CompletionCallback() {
-                        @Override
-                        public void onResult(DJIError error) {
-                        if (error == null) {
-                            DJILog.e(TAG, "Set cameraMode success");
-                            showProgressDialog();
-                            getFileList();
-                        } else {
-                            setResultToToast("Set cameraMode failed");
-                        }
-                        }
-                    });
-                    if (mMediaManager.isVideoPlaybackSupported()) {
-                        DJILog.e(TAG, "Camera support video playback!");
-                    } else {
-                        setResultToToast("Camera does not support video playback!");
-                    }
-                    scheduler = mMediaManager.getScheduler();
-                }
-            } else if (null != SingleApplication.getCameraInstance()
-                    && !SingleApplication.getCameraInstance().isMediaDownloadModeSupported()) {
-                setResultToToast("Media Download Mode not Supported");
-            }
-        }
-        return;
-    }
+//    private void initMediaManager() {
+//        if (SingleApplication.getProductInstance() == null) {
+//            mediaFileList.clear();
+//            DJILog.e(TAG, "Product disconnected");
+//            return;
+//        } else {
+//            if (null != SingleApplication.getCameraInstance() && SingleApplication.getCameraInstance().isMediaDownloadModeSupported()) {
+//                mMediaManager = SingleApplication.getCameraInstance().getMediaManager();
+//                if (null != mMediaManager) {
+//                    mMediaManager.addUpdateFileListStateListener(this.updateFileListStateListener);
+//                    SingleApplication.getCameraInstance().setMode(SettingsDefinitions.CameraMode.MEDIA_DOWNLOAD, new CommonCallbacks.CompletionCallback() {
+//                        @Override
+//                        public void onResult(DJIError error) {
+//                        if (error == null) {
+//                            DJILog.e(TAG, "Set cameraMode success");
+//                            showProgressDialog();
+//                            getFileList();
+//                        } else {
+//                            setResultToToast("Set cameraMode failed");
+//                        }
+//                        }
+//                    });
+//                    if (mMediaManager.isVideoPlaybackSupported()) {
+//                        DJILog.e(TAG, "Camera support video playback!");
+//                    } else {
+//                        setResultToToast("Camera does not support video playback!");
+//                    }
+//                    scheduler = mMediaManager.getScheduler();
+//                }
+//            } else if (null != SingleApplication.getCameraInstance()
+//                    && !SingleApplication.getCameraInstance().isMediaDownloadModeSupported()) {
+//                setResultToToast("Media Download Mode not Supported");
+//            }
+//        }
+//        return;
+//    }
 
-    private void getFileList() {
-        mMediaManager = SingleApplication.getCameraInstance().getMediaManager();
-        if (mMediaManager != null) {
-
-            if ((currentFileListState == MediaManager.FileListState.SYNCING) || (currentFileListState == MediaManager.FileListState.DELETING)){
-                DJILog.e(TAG, "Media Manager is busy.");
-            }else{
-
-                mMediaManager.refreshFileListOfStorageLocation(SettingsDefinitions.StorageLocation.SDCARD, new CommonCallbacks.CompletionCallback() {
-
-                    @Override
-                    public void onResult(DJIError djiError) {
-                    if (null == djiError) {
-                        hideProgressDialog();
-
-                        //Reset data
-                        if (currentFileListState != MediaManager.FileListState.INCOMPLETE) {
-                            mediaFileList.clear();
-                        }
-
-                        mediaFileList = mMediaManager.getSDCardFileListSnapshot();
-                        Collections.sort(mediaFileList, new Comparator<MediaFile>() {
-                            @Override
-                            public int compare(MediaFile lhs, MediaFile rhs) {
-                                if (lhs.getTimeCreated() < rhs.getTimeCreated()) {
-                                    return 1;
-                                } else if (lhs.getTimeCreated() > rhs.getTimeCreated()) {
-                                    return -1;
-                                }
-                                return 0;
-                            }
-                        });
-                        scheduler.resume(new CommonCallbacks.CompletionCallback() {
-                            @Override
-                            public void onResult(DJIError error) {
-                                if (error == null) {
-                                    getThumbnails();
-                                }
-                            }
-                        });
-                    } else {
-                        hideProgressDialog();
-                        setResultToToast("Get Media File List Failed:" + djiError.getDescription());
-                    }
-                    }
-                });
-            }
-        }
-    }
-
-    private void getThumbnailByIndex(final int index) {
-        FetchMediaTask task = new FetchMediaTask(mediaFileList.get(index), FetchMediaTaskContent.THUMBNAIL, taskCallback);
-        scheduler.moveTaskToEnd(task);
-    }
-
-    private void getThumbnails() {
-        if (mediaFileList.size() <= 0) {
-            setResultToToast("No File info for downloading thumbnails");
-            return;
-        }
-        for (int i = 0; i < mediaFileList.size(); i++) {
-            getThumbnailByIndex(i);
-        }
-    }
-
-    private FetchMediaTask.Callback taskCallback = new FetchMediaTask.Callback() {
-        @Override
-        public void onUpdate(MediaFile file, FetchMediaTaskContent option, DJIError error) {
-        if (null == error) {
-            if (option == FetchMediaTaskContent.PREVIEW) {
-                runOnUiThread(new Runnable() {
-                    public void run() {
-                        //mListAdapter.notifyDataSetChanged();
-                    }
-                });
-            }
-            if (option == FetchMediaTaskContent.THUMBNAIL) {
-                runOnUiThread(new Runnable() {
-                    public void run() {
-                        //mListAdapter.notifyDataSetChanged();
-                    }
-                });
-            }
-        } else {
-            DJILog.e(TAG, "Fetch Media Task Failed" + error.getDescription());
-        }
-        }
-    };
+//    private void getFileList() {
+//        mMediaManager = SingleApplication.getCameraInstance().getMediaManager();
+//        if (mMediaManager != null) {
+//
+//            if ((currentFileListState == MediaManager.FileListState.SYNCING) || (currentFileListState == MediaManager.FileListState.DELETING)){
+//                DJILog.e(TAG, "Media Manager is busy.");
+//            }else{
+//
+//                mMediaManager.refreshFileListOfStorageLocation(SettingsDefinitions.StorageLocation.SDCARD, new CommonCallbacks.CompletionCallback() {
+//
+//                    @Override
+//                    public void onResult(DJIError djiError) {
+//                    if (null == djiError) {
+//                        hideProgressDialog();
+//
+//                        //Reset data
+//                        if (currentFileListState != MediaManager.FileListState.INCOMPLETE) {
+//                            mediaFileList.clear();
+//                        }
+//
+//                        mediaFileList = mMediaManager.getSDCardFileListSnapshot();
+//                        Collections.sort(mediaFileList, new Comparator<MediaFile>() {
+//                            @Override
+//                            public int compare(MediaFile lhs, MediaFile rhs) {
+//                                if (lhs.getTimeCreated() < rhs.getTimeCreated()) {
+//                                    return 1;
+//                                } else if (lhs.getTimeCreated() > rhs.getTimeCreated()) {
+//                                    return -1;
+//                                }
+//                                return 0;
+//                            }
+//                        });
+//                        scheduler.resume(new CommonCallbacks.CompletionCallback() {
+//                            @Override
+//                            public void onResult(DJIError error) {
+//                                if (error == null) {
+//                                    getThumbnails();
+//                                }
+//                            }
+//                        });
+//                    } else {
+//                        hideProgressDialog();
+//                        setResultToToast("Get Media File List Failed:" + djiError.getDescription());
+//                    }
+//                    }
+//                });
+//            }
+//        }
+//    }
+//
+//    private void getThumbnailByIndex(final int index) {
+//        FetchMediaTask task = new FetchMediaTask(mediaFileList.get(index), FetchMediaTaskContent.THUMBNAIL, taskCallback);
+//        scheduler.moveTaskToEnd(task);
+//    }
+//
+//    private void getThumbnails() {
+//        if (mediaFileList.size() <= 0) {
+//            setResultToToast("No File info for downloading thumbnails");
+//            return;
+//        }
+//        for (int i = 0; i < mediaFileList.size(); i++) {
+//            getThumbnailByIndex(i);
+//        }
+//    }
+//
+//    private FetchMediaTask.Callback taskCallback = new FetchMediaTask.Callback() {
+//        @Override
+//        public void onUpdate(MediaFile file, FetchMediaTaskContent option, DJIError error) {
+//        if (null == error) {
+//            if (option == FetchMediaTaskContent.PREVIEW) {
+//                runOnUiThread(new Runnable() {
+//                    public void run() {
+//                        //mListAdapter.notifyDataSetChanged();
+//                    }
+//                });
+//            }
+//            if (option == FetchMediaTaskContent.THUMBNAIL) {
+//                runOnUiThread(new Runnable() {
+//                    public void run() {
+//                        //mListAdapter.notifyDataSetChanged();
+//                    }
+//                });
+//            }
+//        } else {
+//            DJILog.e(TAG, "Fetch Media Task Failed" + error.getDescription());
+//        }
+//        }
+//    };
 
 //    private void ShowDownloadProgressDialog() {
 //        if (mDownloadDialog != null) {
@@ -388,26 +561,26 @@ public class MainActivity extends AppCompatActivity implements DJICodecManager.Y
         });
     }
 
-    private void showProgressDialog() {
-        runOnUiThread(new Runnable() {
-            public void run() {
-            if (mLoadingDialog != null) {
-                mLoadingDialog.show();
-            }
-            }
-        });
-    }
-
-    private void hideProgressDialog() {
-
-        runOnUiThread(new Runnable() {
-            public void run() {
-            if (null != mLoadingDialog && mLoadingDialog.isShowing()) {
-                mLoadingDialog.dismiss();
-            }
-            }
-        });
-    }
+//    private void showProgressDialog() {
+//        runOnUiThread(new Runnable() {
+//            public void run() {
+//            if (mLoadingDialog != null) {
+//                mLoadingDialog.show();
+//            }
+//            }
+//        });
+//    }
+//
+//    private void hideProgressDialog() {
+//
+//        runOnUiThread(new Runnable() {
+//            public void run() {
+//            if (null != mLoadingDialog && mLoadingDialog.isShowing()) {
+//                mLoadingDialog.dismiss();
+//            }
+//            }
+//        });
+//    }
 
     private void initDetection(final Size size, final int rotation) {
         tracker = new MultiBoxTracker(this);
@@ -463,6 +636,112 @@ public class MainActivity extends AppCompatActivity implements DJICodecManager.Y
             });
 
         tracker.setFrameConfiguration(previewWidth, previewHeight, sensorOrientation);
+    }
+
+    /**
+     * Init a fake texture view to for the codec manager, so that the video raw data can be received
+     * by the camera
+     */
+    private void initPreviewerTextureView() {
+        videostreamPreviewTtView.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
+            @Override
+            public void onSurfaceTextureAvailable(SurfaceTexture surface, int width, int height) {
+                Log.d(TAG, "real onSurfaceTextureAvailable");
+                videoViewWidth = width;
+                videoViewHeight = height;
+                Log.d(TAG, "real onSurfaceTextureAvailable: width " + videoViewWidth + " height " + videoViewHeight);
+                if (mCodecManager == null) {
+                    mCodecManager = new DJICodecManager(getApplicationContext(), surface, width, height);
+                }
+            }
+
+            @Override
+            public void onSurfaceTextureSizeChanged(SurfaceTexture surface, int width, int height) {
+                videoViewWidth = width;
+                videoViewHeight = height;
+                Log.d(TAG, "real onSurfaceTextureAvailable2: width " + videoViewWidth + " height " + videoViewHeight);
+            }
+
+            @Override
+            public boolean onSurfaceTextureDestroyed(SurfaceTexture surface) {
+                if (mCodecManager != null) {
+                    mCodecManager.cleanSurface();
+                }
+                return false;
+            }
+
+            @Override
+            public void onSurfaceTextureUpdated(SurfaceTexture surface) {
+
+            }
+        });
+    }
+
+    /**
+     * Init a surface view for the DJIVideoStreamDecoder
+     */
+    private void initPreviewerSurfaceView() {
+        videostreamPreviewSh = videostreamPreviewSf.getHolder();
+        surfaceCallback = new SurfaceHolder.Callback() {
+            @Override
+            public void surfaceCreated(SurfaceHolder holder) {
+                Log.d(TAG, "real onSurfaceTextureAvailable");
+                videoViewWidth = videostreamPreviewSf.getWidth();
+                videoViewHeight = videostreamPreviewSf.getHeight();
+                Log.d(TAG, "real onSurfaceTextureAvailable3: width " + videoViewWidth + " height " + videoViewHeight);
+                switch (demoType) {
+                    case USE_SURFACE_VIEW:
+                        if (mCodecManager == null) {
+                            mCodecManager = new DJICodecManager(getApplicationContext(), holder, videoViewWidth,
+                                    videoViewHeight);
+                        }
+                        break;
+                    case USE_SURFACE_VIEW_DEMO_DECODER:
+                        // This demo might not work well on P3C and OSMO.
+                        NativeHelper.getInstance().init();
+                        DJIVideoStreamDecoder.getInstance().init(getApplicationContext(), holder.getSurface());
+                        DJIVideoStreamDecoder.getInstance().resume();
+                        break;
+                }
+
+            }
+
+            @Override
+            public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+                videoViewWidth = width;
+                videoViewHeight = height;
+                Log.d(TAG, "real onSurfaceTextureAvailable4: width " + videoViewWidth + " height " + videoViewHeight);
+                switch (demoType) {
+                    case USE_SURFACE_VIEW:
+                        //mCodecManager.onSurfaceSizeChanged(videoViewWidth, videoViewHeight, 0);
+                        break;
+                    case USE_SURFACE_VIEW_DEMO_DECODER:
+                        DJIVideoStreamDecoder.getInstance().changeSurface(holder.getSurface());
+                        break;
+                }
+
+            }
+
+            @Override
+            public void surfaceDestroyed(SurfaceHolder holder) {
+                switch (demoType) {
+                    case USE_SURFACE_VIEW:
+                        if (mCodecManager != null) {
+                            mCodecManager.cleanSurface();
+                            mCodecManager.destroyCodec();
+                            mCodecManager = null;
+                        }
+                        break;
+                    case USE_SURFACE_VIEW_DEMO_DECODER:
+                        DJIVideoStreamDecoder.getInstance().stop();
+                        NativeHelper.getInstance().release();
+                        break;
+                }
+
+            }
+        };
+
+        videostreamPreviewSh.addCallback(surfaceCallback);
     }
 
     @Override
@@ -612,6 +891,18 @@ public class MainActivity extends AppCompatActivity implements DJICodecManager.Y
 
     private enum DetectorMode {
         TF_OD_API;
+    }
+
+    private void showToast(String s) {
+        mainHandler.sendMessage(
+                mainHandler.obtainMessage(MSG_WHAT_SHOW_TOAST, s)
+        );
+    }
+
+    private void updateTitle(String s) {
+        mainHandler.sendMessage(
+                mainHandler.obtainMessage(MSG_WHAT_UPDATE_TITLE, s)
+        );
     }
 
 }
