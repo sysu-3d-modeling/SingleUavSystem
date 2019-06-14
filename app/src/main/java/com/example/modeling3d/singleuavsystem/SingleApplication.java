@@ -1,6 +1,7 @@
 package com.example.modeling3d.singleuavsystem;
 
 import android.app.Application;
+import android.content.Context;
 import android.content.Intent;
 import android.os.Build;
 import android.os.Handler;
@@ -16,6 +17,9 @@ import dji.common.useraccount.UserAccountState;
 import dji.common.util.CommonCallbacks;
 import dji.sdk.base.BaseComponent;
 import dji.sdk.base.BaseProduct;
+import dji.sdk.camera.Camera;
+import dji.sdk.products.Aircraft;
+import dji.sdk.products.HandHeld;
 import dji.sdk.sdkmanager.DJISDKManager;
 import dji.sdk.useraccount.UserAccountManager;
 
@@ -31,7 +35,7 @@ public class SingleApplication extends Application {
     @Override
     public void onCreate() {
         super.onCreate();
-        MultiDex.install(this);
+        //MultiDex.install(this);
         mHandler = new Handler(Looper.getMainLooper());
 
         //Check the permissions before registering the application for android system 6.0 above.
@@ -114,6 +118,11 @@ public class SingleApplication extends Application {
         };
     }
 
+    @Override
+    public Context getApplicationContext() {
+        return instance;
+    }
+
     private void loginAccount(){
 
         UserAccountManager.getInstance().logIntoDJIUserAccount(this,
@@ -173,4 +182,19 @@ public class SingleApplication extends Application {
         return mProduct;
     }
 
+    public static synchronized Camera getCameraInstance() {
+
+        if (getProductInstance() == null) return null;
+
+        Camera camera = null;
+
+        if (getProductInstance() instanceof Aircraft){
+            camera = ((Aircraft) getProductInstance()).getCamera();
+
+        } else if (getProductInstance() instanceof HandHeld) {
+            camera = ((HandHeld) getProductInstance()).getCamera();
+        }
+
+        return camera;
+    }
 }

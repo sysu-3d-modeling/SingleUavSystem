@@ -22,7 +22,7 @@ public class MApplication extends Application {
     @Override
     public void onCreate() {
         super.onCreate();
-        MultiDex.install(this);
+        //MultiDex.install(this);
         singleApplication.onCreate();
     }
 }

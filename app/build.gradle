@@ -4,7 +4,7 @@ android {
     compileSdkVersion 28
     defaultConfig {
         applicationId "com.example.modeling3d.singleuavsystem"
-        minSdkVersion 18
+        minSdkVersion 21
         targetSdkVersion 28
         versionCode 1
         versionName "1.0"
@@ -55,4 +55,8 @@ dependencies {
 
     implementation ('com.dji:dji-uxsdk:4.9')
     compileOnly ('com.dji:dji-sdk-provided:4.9')
+
+    // tensorflow lite
+    implementation fileTree(dir: 'libs', include: ['*.jar','*.aar'])
+    implementation 'org.tensorflow:tensorflow-lite:0.0.0-nightly'
 }

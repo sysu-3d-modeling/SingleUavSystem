@@ -206,4 +206,16 @@
         custom:excludeItem="ESCStatus"
         android:visibility="gone"/>
 
+    <Button
+        android:id="@+id/downloadBtn"
+        android:layout_width="50dp"
+        android:layout_height="50dp"
+        android:layout_below="@id/camera"
+        android:text="download"/>
+
+    <org.tensorflow.lite.examples.detection.customview.OverlayView
+        android:id="@+id/tracking_overlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
 </RelativeLayout>
